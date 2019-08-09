@@ -28,12 +28,48 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <math.h>
-#include <poll.h>
-#include <sys/eventfd.h>
+#ifdef __WINNT__
+  #include <windows.h>
+#else
+  #include <poll.h>
+  #include <sys/eventfd.h>
+#endif
 #include <string.h>
 #include <libtiepie.h>
 
-#define FD_COUNT 3
+#define EVENT_COUNT 3
+
+#define DEVICE_GONE \
+  { \
+    fprintf(stderr, "Device gone!\n"); \
+    status = EXIT_FAILURE; \
+    goto exit; \
+  }
+
+#define DATA_READY \
+  { \
+    if(raw) \
+      ScpGetDataRaw(scp, buffers, channel_count, 0, record_length); \
+    else \
+      ScpGetData(scp, (float**)buffers, channel_count, 0, record_length); \
+    if(LibGetLastStatus() < LIBTIEPIESTATUS_SUCCESS) \
+    { \
+      fprintf(stderr, "%s failed: %s\n", raw ? "ScpGetDataRaw" : "ScpGetData", LibGetLastStatusStr()); \
+      status = EXIT_FAILURE; \
+      goto exit; \
+    } \
+    n++; \
+    printf("\r%0.1f %%", 100.0 * n / num_blocks); \
+    fflush(stdout); \
+  }
+
+#define DATA_OVERFLOW \
+  { \
+    fprintf(stderr, "Data overflow!\n"); \
+    status = EXIT_FAILURE; \
+    goto exit; \
+  }
+
 
 int main(int argc, char* argv[])
 {
@@ -157,6 +193,17 @@ int main(int argc, char* argv[])
         buffers[i] = NULL;
 
     // Setup events:
+#ifdef __WINNT__
+    HANDLE events[EVENT_COUNT] = {
+      CreateEventA(NULL, FALSE, FALSE, NULL),
+      CreateEventA(NULL, FALSE, FALSE, NULL),
+      CreateEventA(NULL, FALSE, FALSE, NULL)
+    };
+
+    DevSetEventRemoved(scp, events[0]);
+    ScpSetEventDataReady(scp, events[1]);
+    ScpSetEventDataOverflow(scp, events[2]);
+#else
     int fd_removed = eventfd(0, EFD_NONBLOCK);
     int fd_data_ready = eventfd(0, EFD_NONBLOCK);
     int fd_data_overflow = eventfd(0, EFD_NONBLOCK);
@@ -165,11 +212,12 @@ int main(int argc, char* argv[])
     ScpSetEventDataReady(scp, fd_data_ready);
     ScpSetEventDataOverflow(scp, fd_data_overflow);
 
-    struct pollfd fds[FD_COUNT] = {
+    struct pollfd fds[EVENT_COUNT] = {
       {fd: fd_removed, events: POLLIN, revents: 0},
       {fd: fd_data_ready, events: POLLIN, revents: 0},
       {fd: fd_data_overflow, events: POLLIN, revents: 0}
     };
+#endif
 
     if(!ScpStart(scp))
     {
@@ -179,10 +227,34 @@ int main(int argc, char* argv[])
     }
 
     unsigned int n = 0;
-    int r;
-    while(n < num_blocks && (r = poll(fds, FD_COUNT, -1)) >= 0)
+#ifdef __WINNT__
+    DWORD r;
+    while(n < num_blocks && (r = WaitForMultipleObjects(EVENT_COUNT, events, FALSE, INFINITE)) >= WAIT_OBJECT_0)
     {
-      for(int i = 0; i < FD_COUNT; i++)
+      if(r == WAIT_OBJECT_0)
+      {
+        DEVICE_GONE
+      }
+      else if(r == WAIT_OBJECT_0 + 1)
+      {
+        DATA_READY
+      }
+      else if(r == WAIT_OBJECT_0 + 2)
+      {
+        DATA_OVERFLOW
+      }
+      else
+      {
+        fprintf(stderr, "WaitForMultipleObjects() returned: %lu\n", r);
+        status = EXIT_FAILURE;
+        goto exit;
+      }
+    }
+#else
+    int r;
+    while(n < num_blocks && (r = poll(fds, EVENT_COUNT, -1)) >= 0)
+    {
+      for(int i = 0; i < EVENT_COUNT; i++)
       {
         if(fds[i].revents & POLLIN)
         {
@@ -191,41 +263,24 @@ int main(int argc, char* argv[])
 
           if(fds[i].fd == fd_removed)
           {
-            fprintf(stderr, "Device gone!\n");
-            status = EXIT_FAILURE;
-            goto exit;
+            DEVICE_GONE
           }
 
           if(fds[i].fd == fd_data_overflow)
           {
-            fprintf(stderr, "Data overflow!\n");
-            status = EXIT_FAILURE;
-            goto exit;
+            DATA_OVERFLOW
           }
 
           if(fds[i].fd == fd_data_ready)
           {
-            if(raw)
-              ScpGetDataRaw(scp, buffers, channel_count, 0, record_length);
-            else
-              ScpGetData(scp, (float**)buffers, channel_count, 0, record_length);
-
-            if(LibGetLastStatus() < LIBTIEPIESTATUS_SUCCESS)
-            {
-              fprintf(stderr, "%s failed: %s\n", raw ? "ScpGetDataRaw" : "ScpGetData", LibGetLastStatusStr());
-              status = EXIT_FAILURE;
-              goto exit;
-            }
-
-            n++;
-            printf("\r%0.1f %%", 100.0 * n / num_blocks);
-            fflush(stdout);
+            DATA_READY
           }
         }
 
         fds[i].revents = 0;
       }
     }
+#endif
 
     ScpStop(scp);
 
